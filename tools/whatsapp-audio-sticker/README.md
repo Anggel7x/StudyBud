@@ -4,6 +4,8 @@
 
 > ⚠️ This uses an unofficial client, which is against WhatsApp's Terms of Service. Use a spare number, not your main number or anything used for clients. The recipient's WhatsApp must already have the audio-sticker feature, which is still rolling out. Without it, they see nothing or a plain sticker.
 
+See [SETUP.md](SETUP.md) to link or switch the sending phone.
+
 ## Requirements
 - Node 20 or newer
 - `ffmpeg` and `ffprobe` on your PATH

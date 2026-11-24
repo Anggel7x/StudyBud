@@ -242,8 +242,8 @@ export async function resolveTarget(sock, to) {
 	return { jid: g.id, name: `group "${g.subject}"`, ephemeral: g.ephemeralDuration || 0 }
 }
 
-async function listGroups(auth) {
-	const sock = await connect(auth)
+async function listGroups(auth, pair) {
+	const sock = await connect(auth, pair)
 	const groups = Object.values(await sock.groupFetchAllParticipating())
 	for (const g of groups.sort((a, b) => (a.subject ?? '').localeCompare(b.subject ?? ''))) {
 		console.log(`${g.subject}  (${g.id})${g.ephemeralDuration ? `  disappearing: ${g.ephemeralDuration / 86400}d` : ''}`)
@@ -428,7 +428,7 @@ const USAGE = `usage:
         any saved default can be overridden: --to <number|"Group name"> --seconds (1-30, WhatsApp: 10) --disappear 24h|7d|90d|off
         --stanza text|media --pair <your number>
   node audio-sticker.mjs build <visual> [audio] [--out ./out]   make the files without sending
-  node audio-sticker.mjs groups                                 list your groups
+  node audio-sticker.mjs groups [--pair <number>]               list your groups (also links a phone)
   node audio-sticker.mjs logout                                 unlink, to send from a different phone
   node audio-sticker.mjs listen [--out ./captures]              record real sound stickers
   node audio-sticker.mjs check <capture.bin>                    test sidecar maths on a capture`
@@ -441,7 +441,7 @@ async function main() {
 		process.exit(0)
 	}
 	if (cmd === 'groups') {
-		await listGroups(path.join(HERE, 'auth'))
+		await listGroups(path.join(HERE, 'auth'), flags.pair)
 		process.exit(0)
 	}
 	if (cmd === 'logout') {
