@@ -8,7 +8,7 @@
 //       [1] message: Message {
 //         [26] stickerMessage: StickerMessage {
 //           ...normal uploaded WebP sticker fields...
-//           [26] audioMessage: AudioMessage { ...uploaded Ogg/Opus, ptt: true... }
+//           [26] audioMessage: AudioMessage { ...uploaded Ogg/Opus, no ptt, streamingSidecar... }
 //         }
 //       }
 //     }
@@ -22,7 +22,7 @@
 //                                [--stanza text|media] [--pair <your number>] [--auth ./auth]
 
 import { execFile } from 'node:child_process'
-import { randomBytes } from 'node:crypto'
+import { createCipheriv, createHash, createHmac, randomBytes } from 'node:crypto'
 import { mkdtemp, readFile, rm, stat } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
@@ -31,6 +31,7 @@ import {
 	Browsers,
 	DisconnectReason,
 	default as makeWASocket,
+	getMediaKeys,
 	prepareWAMessageMedia,
 	proto,
 	useMultiFileAuthState
@@ -60,15 +61,50 @@ const varint = n => {
 }
 const lengthDelimited = (tag, bytes) => Buffer.concat([varint(tag), varint(bytes.length), Buffer.from(bytes)])
 
+// Extra fields seen on a real audio sticker sent by the official iOS app that Baileys' schema lacks:
+//   AudioMessage.contextInfo[17] -> field 74 { 1: 1, 2: <the audio's own mediaKey> }
+//   StickerMessage field 24 = 0
+const audioContextExtra = mediaKey =>
+	lengthDelimited((17 << 3) | 2, lengthDelimited((74 << 3) | 2, Buffer.concat([Buffer.from([0x08, 0x01]), lengthDelimited((2 << 3) | 2, mediaKey)])))
+const STICKER_FIELD_24 = Buffer.from([0xc0, 0x01, 0x00])
+
 /** Bytes of FutureProofMessage{ message: { stickerMessage: { ...sticker, audioMessage } } } */
 export function encodeAudioStickerWrapper(stickerMessage, audioMessage) {
-	const audioBytes = proto.Message.AudioMessage.encode(audioMessage).finish()
+	const { contextInfo: _ignored, ...audio } = audioMessage
+	const audioBytes = Buffer.concat([
+		proto.Message.AudioMessage.encode(audio).finish(),
+		audio.mediaKey ? audioContextExtra(Buffer.from(audio.mediaKey)) : Buffer.alloc(0)
+	])
 	const stickerBytes = Buffer.concat([
 		proto.Message.StickerMessage.encode(stickerMessage).finish(),
+		STICKER_FIELD_24,
 		lengthDelimited(TAG_STICKER_AUDIO, audioBytes)
 	])
 	const innerMessage = lengthDelimited(TAG_MSG_STICKER, stickerBytes)
 	return lengthDelimited(TAG_FP_MESSAGE, innerMessage)
+}
+
+/**
+ * WhatsApp's streaming sidecar: one 10-byte HMAC per 64 KiB window of (iv || ciphertext || mac),
+ * each window extended by 16 bytes. withMac=false drops the trailing mac from the stream.
+ */
+export async function computeSidecar(encFile, mediaKey, mediaType = 'audio', withMac = true) {
+	const { iv, macKey } = await getMediaKeys(mediaKey, mediaType)
+	const stream = Buffer.concat([iv, withMac ? encFile : encFile.subarray(0, encFile.length - 10)])
+	const out = []
+	for (let i = 0; i < stream.length; i += 65536) {
+		out.push(createHmac('sha256', macKey).update(stream.subarray(i, i + 65536 + 16)).digest().subarray(0, 10))
+	}
+	return Buffer.concat(out)
+}
+
+/** Re-create the encrypted upload (deterministic for a given mediaKey) so we can sign it. */
+export async function encryptMedia(plain, mediaKey, mediaType = 'audio') {
+	const { iv, cipherKey, macKey } = await getMediaKeys(mediaKey, mediaType)
+	const aes = createCipheriv('aes-256-cbc', cipherKey, iv)
+	const cipher = Buffer.concat([aes.update(plain), aes.final()])
+	const mac = createHmac('sha256', macKey).update(iv).update(cipher).digest().subarray(0, 10)
+	return Buffer.concat([cipher, mac])
 }
 
 // Messages carrying this symbol get field 134 appended when Baileys encodes them.
@@ -200,10 +236,23 @@ async function send({ visual, audio, to, seconds, stanza, pair, auth, disappear 
 	const sock = await connect(auth, pair)
 	const upload = sock.waUploadToServer
 	const { stickerMessage } = await prepareWAMessageMedia({ sticker: sticker.buffer }, { upload })
+	// The official app sends the sticker's audio as plain audio: no ptt flag, no waveform.
 	const { audioMessage } = await prepareWAMessageMedia(
-		{ audio: sound.buffer, mimetype: 'audio/ogg; codecs=opus', ptt: true, seconds: sound.seconds, waveform: sound.waveform },
+		{ audio: sound.buffer, mimetype: 'audio/ogg; codecs=opus', ptt: false, seconds: sound.seconds },
 		{ upload }
 	)
+	delete audioMessage.ptt
+	delete audioMessage.waveform
+	const enc = await encryptMedia(sound.buffer, audioMessage.mediaKey)
+	if (!createHash('sha256').update(enc).digest().equals(Buffer.from(audioMessage.fileEncSha256))) {
+		throw new Error('re-encrypted audio does not match the upload; cannot compute sidecar')
+	}
+	audioMessage.streamingSidecar = await computeSidecar(enc, audioMessage.mediaKey)
+	stickerMessage.stickerSentTs = Date.now()
+	stickerMessage.isAvatar = false
+	stickerMessage.isAiSticker = false
+	stickerMessage.isLottie = false
+	stickerMessage.accessibilityLabel = ''
 	stickerMessage.isAnimated = sticker.animated
 	stickerMessage.width = 512
 	stickerMessage.height = 512
@@ -304,6 +353,28 @@ async function listen({ auth, pair, out = './captures' }) {
 	await new Promise(() => {})
 }
 
+/** Find the AudioMessage inside a captured audio sticker and test our sidecar maths against it. */
+async function checkCapture(file) {
+	const get = (buf, f) => parseRaw(buf)?.find(x => x.field === f)?.value
+	let msg = await readFile(file)
+	if (!get(msg, 134) && get(msg, 31)) msg = get(get(msg, 31), 2) // unwrap deviceSentMessage
+	const audio = get(get(get(get(msg, 134), 1), 26), 26)
+	if (!audio) throw new Error('no audio sticker in this capture')
+	const url = Buffer.from(get(audio, 1)).toString()
+	const mediaKey = Buffer.from(get(audio, 7))
+	const encSha = Buffer.from(get(audio, 8))
+	const sidecar = Buffer.from(get(audio, 18))
+	const res = await fetch(url)
+	if (!res.ok) throw new Error(`download failed: HTTP ${res.status} (media links expire; capture a fresh one)`)
+	const enc = Buffer.from(await res.arrayBuffer())
+	console.log(`downloaded ${enc.length} B, encSha256 ${createHash('sha256').update(enc).digest().equals(encSha) ? 'OK' : 'MISMATCH'}`)
+	console.log(`captured sidecar   ${sidecar.toString('hex')}`)
+	for (const withMac of [true, false]) {
+		const mine = await computeSidecar(enc, mediaKey, 'audio', withMac)
+		console.log(`computed (mac=${withMac ? 'yes' : 'no '}) ${mine.toString('hex')} ${mine.equals(sidecar) ? '<-- MATCH' : ''}`)
+	}
+}
+
 // ---------- CLI ----------
 
 function parseArgs(argv) {
@@ -315,6 +386,10 @@ function parseArgs(argv) {
 }
 
 async function main() {
+	if (process.argv[2] === 'check') {
+		await checkCapture(process.argv[3])
+		process.exit(0)
+	}
 	if (process.argv[2] === 'listen') {
 		const opts = { auth: './auth' }
 		const rest = process.argv.slice(3)
