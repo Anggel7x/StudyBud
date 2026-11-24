@@ -36,6 +36,7 @@ import {
 	useMultiFileAuthState
 } from 'baileys'
 import pino from 'pino'
+import sharp from 'sharp'
 import qrcode from 'qrcode-terminal'
 
 const run = promisify(execFile)
@@ -110,12 +111,17 @@ async function toWebp(input, workdir) {
 	const attempts = animated
 		? [{ q: 50, fps: 15, t: 10 }, { q: 30, fps: 10, t: 8 }, { q: 20, fps: 8, t: 6 }, { q: 10, fps: 6, t: 4 }]
 		: [{ q: 80 }, { q: 50 }, { q: 25 }]
+	// ffmpeg only resizes/decodes into formats every build has (PNG / GIF); WebP encoding is done
+	// by sharp, because many ffmpeg builds (e.g. Homebrew's) ship without libwebp.
 	for (const [i, a] of attempts.entries()) {
-		const out = path.join(workdir, `sticker${i}.webp`)
+		const mid = path.join(workdir, `frame${i}.${animated ? 'gif' : 'png'}`)
 		const args = animated
-			? ['-y', '-i', input, '-t', String(a.t), '-an', '-vf', `${scale},fps=${a.fps}`, '-c:v', 'libwebp_anim', '-lossless', '0', '-q:v', String(a.q), '-loop', '0', '-fps_mode', 'passthrough', out]
-			: ['-y', '-i', input, '-an', '-frames:v', '1', '-vf', scale, '-c:v', 'libwebp', '-lossless', '0', '-q:v', String(a.q), out]
+			? ['-y', '-i', input, '-t', String(a.t), '-an', '-vf',
+				`${scale},fps=${a.fps},split[s0][s1];[s0]palettegen=reserve_transparent=1[p];[s1][p]paletteuse`, '-loop', '0', mid]
+			: ['-y', '-i', input, '-an', '-frames:v', '1', '-update', '1', '-vf', scale, mid]
 		await run('ffmpeg', ['-v', 'error', ...args])
+		const out = path.join(workdir, `sticker${i}.webp`)
+		await sharp(mid, { animated }).webp({ quality: a.q, loop: 0, effort: 6 }).toFile(out)
 		const buf = await readFile(out)
 		if (buf.length <= MAX_STICKER_BYTES) return { buffer: buf, animated, file: out }
 	}

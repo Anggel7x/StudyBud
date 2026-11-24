@@ -9,7 +9,8 @@
   "dependencies": {
     "baileys": "7.0.0-rc14",
     "pino": "^10.4.0",
-    "qrcode-terminal": "^0.12.0"
+    "qrcode-terminal": "^0.12.0",
+    "sharp": "^0.34.5"
   },
   "type": "module",
   "private": true
