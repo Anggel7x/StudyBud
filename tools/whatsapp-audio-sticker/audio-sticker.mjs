@@ -193,7 +193,7 @@ function connect(authDir, pairNumber) {
 
 const toJid = to => (to.includes('@') ? to : `${to.replace(/\D/g, '')}@s.whatsapp.net`)
 
-async function send({ visual, audio, to, seconds, stanza, pair, auth }, workdir) {
+async function send({ visual, audio, to, seconds, stanza, pair, auth, disappear }, workdir) {
 	const { sticker, sound } = await prepareFiles(visual, audio, seconds, workdir)
 	console.log(`sticker ${sticker.buffer.length} B (animated=${sticker.animated}), sound ${sound.buffer.length} B, ${sound.seconds}s`)
 
@@ -207,6 +207,9 @@ async function send({ visual, audio, to, seconds, stanza, pair, auth }, workdir)
 	stickerMessage.isAnimated = sticker.animated
 	stickerMessage.width = 512
 	stickerMessage.height = 512
+	// Disappearing-messages chats: the timer must be copied into the sticker or it never disappears.
+	const expiration = { '24h': 86400, '7d': 604800, '90d': 7776000 }[disappear] ?? (Number(disappear) || 0)
+	if (expiration) stickerMessage.contextInfo = { ...stickerMessage.contextInfo, expiration }
 
 	const jid = toJid(to)
 	const message = buildAudioStickerMessage(stickerMessage, audioMessage, { mediaStanza: stanza === 'media' })
@@ -324,6 +327,7 @@ async function main() {
   node audio-sticker.mjs build <image|gif|video> <audio> [--seconds 10] [--out ./out]
   node audio-sticker.mjs send  <image|gif|video> <audio> --to <number|jid> [--seconds 10]
                                [--stanza text|media] [--pair <your number>] [--auth ./auth]
+                               [--disappear 24h|7d|90d]   (match the chat's disappearing timer)
   node audio-sticker.mjs listen [--out ./captures] [--auth ./auth]   (record real sound stickers)`)
 		process.exit(1)
 	}
