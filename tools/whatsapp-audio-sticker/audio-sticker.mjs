@@ -216,6 +216,91 @@ async function send({ visual, audio, to, seconds, stanza, pair, auth }, workdir)
 	sock.end(undefined)
 }
 
+// ---------- listen: capture real audio stickers sent by the official app ----------
+
+function readVarint(buf, pos) {
+	let result = 0, shift = 0, byte
+	do {
+		if (pos >= buf.length) throw new Error('truncated varint')
+		byte = buf[pos++]
+		result += (byte & 0x7f) * 2 ** shift
+		shift += 7
+	} while (byte & 0x80)
+	return [result, pos]
+}
+
+/** Parse raw protobuf without a schema. Returns null if the bytes are not a valid message. */
+function parseRaw(buf) {
+	const fields = []
+	let pos = 0
+	try {
+		while (pos < buf.length) {
+			let tag
+			;[tag, pos] = readVarint(buf, pos)
+			const field = Math.floor(tag / 8), wire = tag & 7
+			if (field === 0) return null
+			if (wire === 0) { let v; [v, pos] = readVarint(buf, pos); fields.push({ field, wire, value: v }) }
+			else if (wire === 1) { fields.push({ field, wire, value: buf.subarray(pos, pos + 8) }); pos += 8 }
+			else if (wire === 5) { fields.push({ field, wire, value: buf.subarray(pos, pos + 4) }); pos += 4 }
+			else if (wire === 2) {
+				let len
+				;[len, pos] = readVarint(buf, pos)
+				if (pos + len > buf.length) return null
+				fields.push({ field, wire, value: buf.subarray(pos, pos + len) })
+				pos += len
+			} else return null
+		}
+	} catch { return null }
+	return pos === buf.length ? fields : null
+}
+
+function dumpRaw(buf, indent = '') {
+	const lines = []
+	for (const { field, wire, value } of parseRaw(buf) ?? []) {
+		if (wire !== 2) { lines.push(`${indent}${field}: ${wire === 0 ? value : Buffer.from(value).toString('hex')}`); continue }
+		const text = Buffer.from(value).toString('utf8')
+		const printable = value.length > 0 && /^[\x20-\x7e]+$/.test(text)
+		const nested = !printable && value.length > 1 ? parseRaw(value) : null
+		if (nested?.length) {
+			lines.push(`${indent}${field} {`, dumpRaw(value, indent + '  '), `${indent}}`)
+		} else if (printable) {
+			lines.push(`${indent}${field}: "${text.length > 200 ? text.slice(0, 200) + '…' : text}"`)
+		} else {
+			const hex = Buffer.from(value).toString('hex')
+			lines.push(`${indent}${field}: <${value.length} bytes> ${hex.length > 80 ? hex.slice(0, 80) + '…' : hex}`)
+		}
+	}
+	return lines.join('\n')
+}
+
+async function listen({ auth, pair, out = './captures' }) {
+	const { mkdir, writeFile } = await import('node:fs/promises')
+	await mkdir(out, { recursive: true })
+	let n = 0
+	// Baileys drops fields its schema doesn't know, so look at the raw bytes before it decodes them.
+	// A message is captured if it mentions field 134, has a sticker, or loses bytes on decode→encode
+	// (i.e. contains fields Baileys doesn't know).
+	const originalDecode = proto.Message.decode
+	proto.Message.decode = function decode(r, l, e) {
+		const msg = originalDecode.call(this, r, l, e)
+		if (l === undefined && r instanceof Uint8Array) {
+			const raw = Buffer.from(r)
+			const json = JSON.stringify(msg.toJSON())
+			const lossy = originalEncode.call(proto.Message, msg).finish().length < raw.length
+			if (lossy || /stickerMessage/.test(json)) {
+				const name = `capture-${Date.now()}-${++n}`
+				writeFile(path.join(out, `${name}.bin`), raw)
+				writeFile(path.join(out, `${name}.txt`), `${dumpRaw(raw)}\n\n--- as Baileys sees it ---\n${JSON.stringify(msg.toJSON(), null, 2)}\n`)
+				console.log(`captured ${name} (${raw.length} B${lossy ? ', has fields Baileys does not know' : ''}) -> ${out}/${name}.txt`)
+			}
+		}
+		return msg
+	}
+	await connect(auth, pair)
+	console.log(`listening... send a sound sticker from the official app (to or from this account). Ctrl+C to stop.`)
+	await new Promise(() => {})
+}
+
 // ---------- CLI ----------
 
 function parseArgs(argv) {
@@ -227,12 +312,19 @@ function parseArgs(argv) {
 }
 
 async function main() {
+	if (process.argv[2] === 'listen') {
+		const opts = { auth: './auth' }
+		const rest = process.argv.slice(3)
+		for (let i = 0; i < rest.length; i += 2) opts[rest[i].replace(/^--/, '')] = rest[i + 1]
+		return listen(opts)
+	}
 	const opts = parseArgs(process.argv.slice(2))
 	if (!['build', 'send'].includes(opts.cmd) || !opts.visual || !opts.audio || (opts.cmd === 'send' && !opts.to)) {
 		console.log(`usage:
   node audio-sticker.mjs build <image|gif|video> <audio> [--seconds 10] [--out ./out]
   node audio-sticker.mjs send  <image|gif|video> <audio> --to <number|jid> [--seconds 10]
-                               [--stanza text|media] [--pair <your number>] [--auth ./auth]`)
+                               [--stanza text|media] [--pair <your number>] [--auth ./auth]
+  node audio-sticker.mjs listen [--out ./captures] [--auth ./auth]   (record real sound stickers)`)
 		process.exit(1)
 	}
 	await stat(opts.visual)
