@@ -13,32 +13,23 @@ cd tools/whatsapp-audio-sticker
 npm install
 ```
 
-## 1. Build the files locally (no WhatsApp needed)
+## Quick use
+Save your defaults once:
 ```bash
-node audio-sticker.mjs build cat.png meow.mp3 --out ./out
+node audio-sticker.mjs config --to 34600111222 --seconds 5 --disappear 90d
 ```
-This writes `out/sticker.webp` and `out/sound.ogg`, so you can check both before sending.
-
-## 2. Send
+Then, from anywhere:
 ```bash
-# First run: scan the QR with the spare phone (WhatsApp > Linked devices)
-node audio-sticker.mjs send cat.png meow.mp3 --to 34600111222
-
-# Or link with a pairing code instead of a QR
-node audio-sticker.mjs send cat.png meow.mp3 --to 34600111222 --pair 34600999888
+node audio-sticker.mjs send clip.mp4                # one video = picture + sound
+node audio-sticker.mjs send cat.gif meow.mp3        # separate picture and sound
+node audio-sticker.mjs send clip.mp4 --seconds 8    # override any default once
 ```
-- `--to`: a phone number in international format with no `+`, or a full JID such as `1234@g.us` for a group.
-- The visual can be an image (static sticker), or a GIF or video (animated sticker, cut to fit under 1 MB).
-- `--seconds N`: how much of the audio to keep. The default is 10.
-- The login is saved in `./auth`, so later runs don't ask you to scan again.
-
-### If the sticker doesn't arrive or is silent
-The community hasn't settled how the outer message is labelled, so try the other option:
-```bash
-node audio-sticker.mjs send cat.png meow.mp3 --to 34600111222 --stanza media
-```
-- `--stanza text` (the default) matches zapota, which has been tested on phones.
-- `--stanza media` sends `type="media"` with `mediatype="sticker"`, which is how whatsapp-rust does it.
+- On the first send, link the phone. Scan the QR code, or add `--pair <your number>` to get a code instead.
+- The picture can be an image, a GIF or a video.
+- The sound can be any audio or video file. Only its first `--seconds` are used.
+- WhatsApp's limit for the sound is 10 s. The script accepts up to 30 s.
+- If the sticker doesn't arrive or plays no sound, add `--stanza media`.
+- Run `node audio-sticker.mjs` with no arguments to see every option.
 
 ## How it works
 Baileys' protobuf schema doesn't know these fields yet, so the script encodes two layers by hand:
@@ -49,9 +40,10 @@ Message
  └─ [134] audioStickerMessage : FutureProofMessage
        └─ [1] message : Message
              └─ [26] stickerMessage : StickerMessage   (uploaded WebP)
-                   └─ [26] audioMessage : AudioMessage (uploaded Ogg/Opus, ptt=true, waveform)
+                   └─ [26] audioMessage : AudioMessage (uploaded Ogg/Opus, sidecar)
 ```
 - Both media files are uploaded with Baileys' normal `prepareWAMessageMedia`.
+- The audio carries no `ptt` flag or waveform. It has a `streamingSidecar` and `contextInfo` field 74, both checked against a real sticker the iOS app sent.
 - `proto.Message.encode` is wrapped so it adds field 134 to the outgoing message.
 - Baileys is pinned to `7.0.0-rc14` because the script patches its encoder.
 - The audio is Opus in Ogg, made with `-vbr on -compression_level 10 -frame_duration 20 -avoid_negative_ts make_zero`. Without those flags, phones show the sticker but won't play the sound.

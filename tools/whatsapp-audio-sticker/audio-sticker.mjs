@@ -16,10 +16,7 @@
 // Baileys' bundled protobuf schema does not know field 134 or StickerMessage field 26,
 // so we encode those two layers by hand and splice them in when Baileys encodes the message.
 //
-// Usage:
-//   node audio-sticker.mjs build <image|gif|video> <audio> [--seconds 10]
-//   node audio-sticker.mjs send  <image|gif|video> <audio> --to <number|jid> [--seconds 10]
-//                                [--stanza text|media] [--pair <your number>] [--auth ./auth]
+// Usage: run `node audio-sticker.mjs` with no arguments.
 
 import { execFile } from 'node:child_process'
 import { createCipheriv, createHash, createHmac, randomBytes } from 'node:crypto'
@@ -325,7 +322,7 @@ function dumpRaw(buf, indent = '') {
 	return lines.join('\n')
 }
 
-async function listen({ auth, pair, out = './captures' }) {
+async function listen({ auth, pair, out }) {
 	const { mkdir, writeFile } = await import('node:fs/promises')
 	await mkdir(out, { recursive: true })
 	let n = 0
@@ -377,33 +374,56 @@ async function checkCapture(file) {
 
 // ---------- CLI ----------
 
+const HERE = path.dirname(new URL(import.meta.url).pathname)
+const CONFIG = path.join(HERE, 'config.json') // your saved defaults (gitignored)
+
+/** Flags (--name value) may go anywhere; everything else is a positional argument. */
 function parseArgs(argv) {
-	const [cmd, visual, audio, ...rest] = argv
-	const opts = { cmd, visual, audio, seconds: 10, stanza: 'text', auth: './auth' }
-	for (let i = 0; i < rest.length; i += 2) opts[rest[i].replace(/^--/, '')] = rest[i + 1]
-	opts.seconds = Math.min(30, Math.max(1, Number(opts.seconds) || 10))
-	return opts
+	const flags = {}, positional = []
+	for (let i = 0; i < argv.length; i++) {
+		if (argv[i].startsWith('--')) flags[argv[i].slice(2)] = argv[++i]
+		else positional.push(argv[i])
+	}
+	return { flags, positional }
 }
 
+async function loadConfig() {
+	try { return JSON.parse(await readFile(CONFIG, 'utf8')) } catch { return {} }
+}
+
+const USAGE = `usage:
+  node audio-sticker.mjs config --to <number> [--seconds 5] [--disappear 90d] [--stanza text]
+        save defaults once; then:
+  node audio-sticker.mjs send <video>                      one file = picture + sound
+  node audio-sticker.mjs send <image|gif|video> <audio>    separate picture and sound
+        any saved default can be overridden: --to --seconds (1-30, WhatsApp: 10) --disappear 24h|7d|90d|off
+        --stanza text|media --pair <your number>
+  node audio-sticker.mjs build <visual> [audio] [--out ./out]   make the files without sending
+  node audio-sticker.mjs listen [--out ./captures]              record real sound stickers
+  node audio-sticker.mjs check <capture.bin>                    test sidecar maths on a capture`
+
 async function main() {
-	if (process.argv[2] === 'check') {
-		await checkCapture(process.argv[3])
+	const [cmd, ...args] = process.argv.slice(2)
+	const { flags, positional } = parseArgs(args)
+	if (cmd === 'check') {
+		await checkCapture(positional[0])
 		process.exit(0)
 	}
-	if (process.argv[2] === 'listen') {
-		const opts = { auth: './auth' }
-		const rest = process.argv.slice(3)
-		for (let i = 0; i < rest.length; i += 2) opts[rest[i].replace(/^--/, '')] = rest[i + 1]
-		return listen(opts)
+	if (cmd === 'listen') return listen({ auth: path.join(HERE, 'auth'), out: path.join(HERE, 'captures'), ...flags })
+	if (cmd === 'config') {
+		const { writeFile } = await import('node:fs/promises')
+		const cfg = { ...(await loadConfig()), ...flags }
+		await writeFile(CONFIG, JSON.stringify(cfg, null, 2) + '\n')
+		console.log(`saved ${CONFIG}:`, cfg)
+		process.exit(0)
 	}
-	const opts = parseArgs(process.argv.slice(2))
-	if (!['build', 'send'].includes(opts.cmd) || !opts.visual || !opts.audio || (opts.cmd === 'send' && !opts.to)) {
-		console.log(`usage:
-  node audio-sticker.mjs build <image|gif|video> <audio> [--seconds 10] [--out ./out]
-  node audio-sticker.mjs send  <image|gif|video> <audio> --to <number|jid> [--seconds 10]
-                               [--stanza text|media] [--pair <your number>] [--auth ./auth]
-                               [--disappear 24h|7d|90d]   (match the chat's disappearing timer)
-  node audio-sticker.mjs listen [--out ./captures] [--auth ./auth]   (record real sound stickers)`)
+	const opts = { stanza: 'text', auth: path.join(HERE, 'auth'), ...(await loadConfig()), ...flags, cmd }
+	;[opts.visual, opts.audio] = positional
+	opts.audio ??= opts.visual
+	if (opts.disappear === 'off') delete opts.disappear
+	opts.seconds = Math.min(30, Math.max(1, Number(opts.seconds) || 10))
+	if (!['build', 'send'].includes(cmd) || !opts.visual || (cmd === 'send' && !opts.to)) {
+		console.log(cmd === 'send' && opts.visual ? 'no recipient: pass --to or save one with the config command\n' + USAGE : USAGE)
 		process.exit(1)
 	}
 	await stat(opts.visual)
@@ -412,7 +432,7 @@ async function main() {
 	try {
 		if (opts.cmd === 'build') {
 			const { sticker, sound } = await prepareFiles(opts.visual, opts.audio, opts.seconds, workdir)
-			const out = opts.out ?? './out'
+			const out = opts.out ?? path.join(HERE, 'out')
 			await run('mkdir', ['-p', out])
 			await run('cp', [sticker.file, path.join(out, 'sticker.webp')])
 			await run('cp', [sound.file, path.join(out, 'sound.ogg')])
