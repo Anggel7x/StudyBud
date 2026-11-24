@@ -141,7 +141,7 @@ async function probe(file) {
 	return { duration, hasVideo: !!video, animated: !!video && (frames > 1 || (frames === 0 && duration > 0.2)) }
 }
 
-async function toWebp(input, workdir) {
+async function toWebp(input, workdir, maxSeconds = 10) {
 	const { animated } = await probe(input)
 	const scale = 'scale=512:512:force_original_aspect_ratio=decrease,pad=512:512:(ow-iw)/2:(oh-ih)/2:color=0x00000000'
 	const attempts = animated
@@ -152,7 +152,7 @@ async function toWebp(input, workdir) {
 	for (const [i, a] of attempts.entries()) {
 		const mid = path.join(workdir, `frame${i}.${animated ? 'gif' : 'png'}`)
 		const args = animated
-			? ['-y', '-i', input, '-t', String(a.t), '-an', '-vf',
+			? ['-y', '-i', input, '-t', String(Math.min(a.t, maxSeconds)), '-an', '-vf',
 				`${scale},fps=${a.fps},split[s0][s1];[s0]palettegen=reserve_transparent=1[p];[s1][p]paletteuse`, '-loop', '0', mid]
 			: ['-y', '-i', input, '-an', '-frames:v', '1', '-update', '1', '-vf', scale, mid]
 		await run('ffmpeg', ['-v', 'error', ...args])
@@ -191,7 +191,7 @@ function waveformFromPcm(pcm, bars = 64) {
 }
 
 export async function prepareFiles(visual, audio, seconds, workdir) {
-	const [sticker, sound] = await Promise.all([toWebp(visual, workdir), toOggOpus(audio, workdir, seconds)])
+	const [sticker, sound] = await Promise.all([toWebp(visual, workdir, seconds), toOggOpus(audio, workdir, seconds)])
 	return { sticker, sound }
 }
 
