@@ -226,7 +226,32 @@ function connect(authDir, pairNumber) {
 
 const toJid = to => (to.includes('@') ? to : `${to.replace(/\D/g, '')}@s.whatsapp.net`)
 
-async function send({ visual, audio, to, seconds, stanza, pair, auth, disappear }, workdir) {
+/** --to can be a phone number, a JID, or the name of a group you are in. */
+export async function resolveTarget(sock, to) {
+	to = String(to)
+	if (to.includes('@') || /^\+?[\d\s()-]+$/.test(to)) return { jid: toJid(to), name: to }
+	const groups = Object.values(await sock.groupFetchAllParticipating())
+	const wanted = to.trim().toLowerCase()
+	let hits = groups.filter(g => (g.subject ?? '').trim().toLowerCase() === wanted)
+	if (!hits.length) hits = groups.filter(g => (g.subject ?? '').toLowerCase().includes(wanted))
+	if (hits.length !== 1) {
+		const list = (hits.length ? hits : groups).map(g => `  ${g.subject}  (${g.id})`).join('\n')
+		throw new Error(`${hits.length ? 'Several' : 'No'} groups match "${to}". ${hits.length ? 'Matches' : 'Your groups'}:\n${list}\nUse the exact name or the id.`)
+	}
+	const g = hits[0]
+	return { jid: g.id, name: `group "${g.subject}"`, ephemeral: g.ephemeralDuration || 0 }
+}
+
+async function listGroups(auth) {
+	const sock = await connect(auth)
+	const groups = Object.values(await sock.groupFetchAllParticipating())
+	for (const g of groups.sort((a, b) => (a.subject ?? '').localeCompare(b.subject ?? ''))) {
+		console.log(`${g.subject}  (${g.id})${g.ephemeralDuration ? `  disappearing: ${g.ephemeralDuration / 86400}d` : ''}`)
+	}
+	sock.end(undefined)
+}
+
+async function send({ visual, audio, to, seconds, stanza, pair, auth, disappear, cliDisappear }, workdir) {
 	const { sticker, sound } = await prepareFiles(visual, audio, seconds, workdir)
 	console.log(`sticker ${sticker.buffer.length} B (animated=${sticker.animated}), sound ${sound.buffer.length} B, ${sound.seconds}s`)
 
@@ -254,13 +279,17 @@ async function send({ visual, audio, to, seconds, stanza, pair, auth, disappear 
 	stickerMessage.width = 512
 	stickerMessage.height = 512
 	// Disappearing-messages chats: the timer must be copied into the sticker or it never disappears.
-	const expiration = { '24h': 86400, '7d': 604800, '90d': 7776000 }[disappear] ?? (Number(disappear) || 0)
-	if (expiration) stickerMessage.contextInfo = { ...stickerMessage.contextInfo, expiration }
+	const target = await resolveTarget(sock, to)
+	// Groups: use the group's own timer unless --disappear was given on the command line.
+	const timer = target.ephemeral !== undefined && cliDisappear === undefined
+		? target.ephemeral
+		: { '24h': 86400, '7d': 604800, '90d': 7776000, off: 0 }[disappear] ?? (Number(disappear) || 0)
+	if (timer) stickerMessage.contextInfo = { ...stickerMessage.contextInfo, expiration: timer }
 
-	const jid = toJid(to)
+	const jid = target.jid
 	const message = buildAudioStickerMessage(stickerMessage, audioMessage, { mediaStanza: stanza === 'media' })
 	const id = await sock.relayMessage(jid, message, {})
-	console.log(`sent ${id} to ${jid} (stanza ${stanza === 'media' ? 'type=media mediatype=sticker' : 'type=text'})`)
+	console.log(`sent ${id} to ${target.name} [${jid}] (stanza ${stanza === 'media' ? 'type=media mediatype=sticker' : 'type=text'})`)
 	await new Promise(r => setTimeout(r, 3000)) // let acks flush
 	sock.end(undefined)
 }
@@ -392,13 +421,15 @@ async function loadConfig() {
 }
 
 const USAGE = `usage:
-  node audio-sticker.mjs config --to <number> [--seconds 5] [--disappear 90d] [--stanza text]
-        save defaults once; then:
+  node audio-sticker.mjs config --to <number|group name> [--seconds 5] [--disappear 90d] [--stanza text]
+        save defaults once (run again any time to change them); then:
   node audio-sticker.mjs send <video>                      one file = picture + sound
   node audio-sticker.mjs send <image|gif|video> <audio>    separate picture and sound
-        any saved default can be overridden: --to --seconds (1-30, WhatsApp: 10) --disappear 24h|7d|90d|off
+        any saved default can be overridden: --to <number|"Group name"> --seconds (1-30, WhatsApp: 10) --disappear 24h|7d|90d|off
         --stanza text|media --pair <your number>
   node audio-sticker.mjs build <visual> [audio] [--out ./out]   make the files without sending
+  node audio-sticker.mjs groups                                 list your groups
+  node audio-sticker.mjs logout                                 unlink, to send from a different phone
   node audio-sticker.mjs listen [--out ./captures]              record real sound stickers
   node audio-sticker.mjs check <capture.bin>                    test sidecar maths on a capture`
 
@@ -407,6 +438,15 @@ async function main() {
 	const { flags, positional } = parseArgs(args)
 	if (cmd === 'check') {
 		await checkCapture(positional[0])
+		process.exit(0)
+	}
+	if (cmd === 'groups') {
+		await listGroups(path.join(HERE, 'auth'))
+		process.exit(0)
+	}
+	if (cmd === 'logout') {
+		await rm(path.join(HERE, 'auth'), { recursive: true, force: true })
+		console.log('Unlinked locally. Also remove the old "Chrome (Mac OS)" entry in WhatsApp > Linked devices on that phone.\nThe next send will ask you to link a phone again (QR, or --pair <number>).')
 		process.exit(0)
 	}
 	if (cmd === 'listen') return listen({ auth: path.join(HERE, 'auth'), out: path.join(HERE, 'captures'), ...flags })
@@ -420,7 +460,7 @@ async function main() {
 	const opts = { stanza: 'text', auth: path.join(HERE, 'auth'), ...(await loadConfig()), ...flags, cmd }
 	;[opts.visual, opts.audio] = positional
 	opts.audio ??= opts.visual
-	if (opts.disappear === 'off') delete opts.disappear
+	opts.cliDisappear = flags.disappear
 	opts.seconds = Math.min(30, Math.max(1, Number(opts.seconds) || 10))
 	if (!['build', 'send'].includes(cmd) || !opts.visual || (cmd === 'send' && !opts.to)) {
 		console.log(cmd === 'send' && opts.visual ? 'no recipient: pass --to or save one with the config command\n' + USAGE : USAGE)
